@@ -708,6 +708,7 @@ body::-webkit-scrollbar-thumb{background:var(--border2);border-radius:3px}
 
 <canvas id="hiddenCanvas"></canvas>
 
+<script src="https://unpkg.com/@ffmpeg/ffmpeg@0.11.6/dist/ffmpeg.min.js"></script>
 <script>
 const baseTransitions = [
   // === FADE ===
@@ -965,6 +966,7 @@ const recordingFormats = [
   { mimeType: 'video/webm', ext: 'webm' }
 ];
 const preferredRecordingFormat = getRecordingFormat();
+let ffmpegInstancePromise = null;
 
 // Init
 renderTransitions();
@@ -989,6 +991,52 @@ function getRecordingFormat() {
 
 function getExtensionFromMimeType(mimeType) {
   return mimeType && mimeType.includes('webm') ? 'webm' : 'mp4';
+}
+
+async function getFFmpegInstance() {
+  if (ffmpegInstancePromise) return ffmpegInstancePromise;
+  ffmpegInstancePromise = (async () => {
+    if (typeof FFmpeg === 'undefined' || typeof FFmpeg.createFFmpeg !== 'function') {
+      throw new Error('FFmpeg.wasm tidak tersedia');
+    }
+    const ffmpeg = FFmpeg.createFFmpeg({
+      log: false,
+      corePath: 'https://unpkg.com/@ffmpeg/core@0.11.0/dist/ffmpeg-core.js'
+    });
+    await ffmpeg.load();
+    return ffmpeg;
+  })();
+  return ffmpegInstancePromise;
+}
+
+async function convertBlobToMp4(blob, videoId) {
+  if ((blob.type || '').includes('mp4')) {
+    return { blob, mimeType: 'video/mp4', ext: 'mp4' };
+  }
+
+  const ffmpeg = await getFFmpegInstance();
+  const inputName = `input_${videoId}.webm`;
+  const outputName = `output_${videoId}.mp4`;
+
+  ffmpeg.FS('writeFile', inputName, await FFmpeg.fetchFile(blob));
+  try {
+    await ffmpeg.run(
+      '-i', inputName,
+      '-c:v', 'libx264',
+      '-pix_fmt', 'yuv420p',
+      '-movflags', 'faststart',
+      outputName
+    );
+    const data = ffmpeg.FS('readFile', outputName);
+    return {
+      blob: new Blob([data.buffer], { type: 'video/mp4' }),
+      mimeType: 'video/mp4',
+      ext: 'mp4'
+    };
+  } finally {
+    try { ffmpeg.FS('unlink', inputName); } catch {}
+    try { ffmpeg.FS('unlink', outputName); } catch {}
+  }
 }
 
 // Drag/drop
@@ -1147,7 +1195,7 @@ function renderQueue() {
         <div class="qi-meta">${v.photos.length} foto · ${v.fps} FPS · ${trLabel(v.transition)} · ${colLabel(v.colorFilter)}</div>
       </div>
       <span class="qi-status s-pending" id="qs-${v.id}">Menunggu</span>
-      <a id="dl-${v.id}" style="display:none" class="qi-dl" download="video_${v.id}.${preferredRecordingFormat.ext}">⬇ Unduh</a>
+      <a id="dl-${v.id}" style="display:none" class="qi-dl" download="video_${v.id}.mp4">⬇ Unduh</a>
     </div>`
   ).join('');
 }
@@ -1235,16 +1283,17 @@ async function generateVideo(idx) {
     await sleep(200);
     rec.stop();
     await new Promise(r => rec.onstop = r);
-    const outputMimeType = rec.mimeType || mimeType || 'video/mp4';
-    const blob = new Blob(chunks, { type: outputMimeType });
-    const outputExt = getExtensionFromMimeType(outputMimeType);
-    v.blob = blob;
-    v.mimeType = outputMimeType;
-    v.ext = outputExt;
-    const url = URL.createObjectURL(blob);
+    const recordedMimeType = rec.mimeType || mimeType || 'video/webm';
+    const recordedBlob = new Blob(chunks, { type: recordedMimeType });
+    setQueueStatus(v.id, 'processing', '⟳ Konversi MP4');
+    const converted = await convertBlobToMp4(recordedBlob, v.id);
+    v.blob = converted.blob;
+    v.mimeType = converted.mimeType;
+    v.ext = converted.ext;
+    const url = URL.createObjectURL(converted.blob);
     const dl = document.getElementById('dl-' + v.id);
     dl.href = url;
-    dl.download = `video_${v.id}.${outputExt}`;
+    dl.download = `video_${v.id}.${converted.ext}`;
     dl.style.display = '';
     setQueueStatus(v.id, 'done', '✓ Selesai');
   } catch (e) {
